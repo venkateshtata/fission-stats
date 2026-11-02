@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fission — programme stats</title>
+<style>
+  :root { --ink:#111; --muted:#6b7280; --rule:#e3e4e8; --bg:#fff; --tint:#f4f5f7; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:1080px; margin:0 auto; padding:28px 20px 60px; }
+  h1 { font-size:20px; font-weight:600; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 18px; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:18px; }
+  button { font:inherit; padding:6px 12px; border:1px solid var(--rule); background:#fff; border-radius:4px; cursor:pointer; }
+  button:hover { background:var(--tint); }
+  button.primary { border-color:#111; }
+  .src { font-size:12px; padding:4px 8px; border-radius:3px; background:var(--tint); color:var(--muted); }
+  .src.live { background:#e8f3ea; color:#1c5c2b; }
+  .src.demo { background:#fdf3e2; color:#7a5310; }
+  .src.err { background:#fbe9e9; color:#8a2020; white-space:pre-wrap; }
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:1px; background:var(--rule);
+          border:1px solid var(--rule); margin-bottom:22px; }
+  .kpi { background:#fff; padding:12px 14px; }
+  .kpi b { display:block; font-size:26px; font-weight:600; line-height:1.1; }
+  .kpi span { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
+       margin:26px 0 8px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--rule); }
+  th { font-weight:600; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  tr:last-child td { border-bottom:none; }
+  .empty { color:var(--muted); font-size:13px; padding:10px 0; }
+  tfoot tr.foot td { border-top:1px solid #c9cbd1; border-bottom:none; font-weight:600; }
+  dialog { border:1px solid var(--rule); border-radius:6px; padding:20px; width:min(560px,92vw); }
+  dialog h3 { margin:0 0 4px; font-size:15px; }
+  dialog p { color:var(--muted); font-size:12.5px; margin:0 0 14px; }
+  label { display:block; font-size:12px; margin:10px 0 4px; }
+  input { width:100%; font:inherit; padding:7px 9px; border:1px solid var(--rule); border-radius:4px; }
+  .hint { font-size:11.5px; color:var(--muted); margin-top:3px; }
+  .actions { display:flex; gap:8px; justify-content:flex-end; margin-top:18px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Fission — programme stats</h1>
+  <p class="sub">Reads the three trackers from Google Sheets. Nothing is stored on a server; the page fetches and counts in the browser.</p>
+
+  <div class="bar">
+    <span id="src" class="src">not configured</span>
+    <button id="refresh">Refresh</button>
+    <button id="settings">Sources</button>
+    <button id="demo">Use demo data</button>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <h2>Verification by harm class</h2>
+  <div id="verif"></div>
+
+  <h2>Intake by product</h2>
+  <div id="byproduct"></div>
+
+  <h2>Output by day</h2>
+  <div id="output"></div>
+
+  <h2>Working on next</h2>
+  <div id="next"></div>
+</div>
+
+<dialog id="dlg">
+  <h3>Sheet sources</h3>
+  <p>Paste each sheet's link. Every sheet must be shared as <b>Anyone with the link — Viewer</b>. The tab name defaults to the first tab; put <code>#TabName</code> on the end of the link to change it.</p>
+  <label>Standup sheet</label>
+  <input id="uStandup" placeholder="https://docs.google.com/spreadsheets/d/…">
+  <label>Exploit intake sheet</label>
+  <input id="uIntake" placeholder="https://docs.google.com/spreadsheets/d/…">
+  <label>Verification sheet</label>
+  <input id="uVerif" placeholder="https://docs.google.com/spreadsheets/d/…">
+  <div class="hint">Links stay in this browser (localStorage).</div>
+  <div class="actions">
+    <button id="cancel">Cancel</button>
+    <button id="save" class="primary">Save and load</button>
+  </div>
+</dialog>
+
+<script>
+const KEYS = { standup:"fs.standup", intake:"fs.intake", verif:"fs.verif" };
+const $ = (id) => document.getElementById(id);
+let timer = null;
+
+/* ── sheet reading ─────────────────────────────────────────────── */
+
+function parseSheetLink(raw) {
+  const s = (raw || "").trim();
+  if (!s) return null;
+  const m = s.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/) || s.match(/^([a-zA-Z0-9-_]{20,})$/);
+  if (!m) return null;
+  const tab = (s.split("#")[1] || "").trim();
+  return { id: m[1], tab: tab || null };
+}
+
+function gvizUrl({ id, tab }) {
+  const q = new URLSearchParams({ tqx:"out:json", headers:"1" });
+  if (tab) q.set("sheet", tab);
+  return `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?${q}`;
+}
+
+async function fetchTable(src) {
+  const res = await fetch(gvizUrl(src), { cache:"no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const text = await res.text();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end < 0) throw new Error("no data returned — is the sheet shared?");
+  const payload = JSON.parse(text.slice(start, end + 1));
+  if (payload.status === "error") throw new Error(payload.errors?.[0]?.detailed_message || "sheet error");
+  const cols = (payload.table.cols || []).map((c, i) => (c.label || c.id || `col${i}`).trim());
+  const rows = (payload.table.rows || []).map((r) =>
+    (r.c || []).map((cell, i) => {
+      if (!cell) return "";
+      if (cell.f) return cell.f;
+      const v = cell.v;
+      if (v === null || v === undefined) return "";
+      if (typeof v === "string" && /^Date\(\d{4},\d{1,2},\d{1,2}\)$/.test(v)) {
+        const [, y, mo, d] = v.match(/Date\((\d+),(\d+),(\d+)\)/);
+        return new Date(+y, +mo, +d).toISOString().slice(0, 10);
+      }
+      return String(v).trim();
+    })
+  );
+  const pick = (name) => cols.findIndex((c) => c.toLowerCase().startsWith(name.toLowerCase()));
+  return { cols, rows, index: { pick } };
+}
+
+const idx = (t, name) => t.index.pick(name);
+const cell = (t, r, name) => { const i = idx(t, name); return i < 0 ? "" : (t.rows[r][i] || ""); };
+
+/* ── stats ─────────────────────────────────────────────────────── */
+
+function tally(rows, keyFn) {
+  const out = new Map();
+  for (const r of rows) {
+    const k = keyFn(r) || "—";
+    out.set(k, (out.get(k) || 0) + 1);
+  }
+  return [...out.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+
+function stats(verif, intake, standup) {
+  const st = (t, i, r) => t.rows[r][i] || "";
+  const vState = idx(verif, "Verification status");
+  const verdicts = verif.rows.map((_, r) => (st(verif, vState, r) || "backlog").toLowerCase());
+  const harm = verif.rows.map((_, r) => st(verif, idx(verif, "Harm class"), r));
+  const product = intake.rows.map((_, r) => st(intake, idx(intake, "Product"), r));
+  const created = standup.rows.map((_, r) => {
+    const v = st(standup, idx(standup, "Exploits created"), r);
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  });
+  const byHarm = new Map();
+  harm.forEach((h, i) => {
+    const k = h || "—";
+    const e = byHarm.get(k) || { success:0, fail:0, backlog:0 };
+    const v = verdicts[i];
+    if (e[v] !== undefined) e[v]++; else e.backlog++;
+    byHarm.set(k, e);
+  });
+  const next = standup.rows.map((_, r) => ({
+    date: st(standup, idx(standup, "Date"), r),
+    person: st(standup, idx(standup, "Person"), r),
+    next: st(standup, idx(standup, "Working on next"), r),
+  })).reverse().filter((x) => x.next);
+
+  const done = verdicts.filter((v) => v === "success" || v === "fail").length;
+  const success = verdicts.filter((v) => v === "success").length;
+  const out = {
+    logged: intake.rows.length,
+    success,
+    fail: verdicts.filter((v) => v === "fail").length,
+    backlog: verdicts.filter((v) => v !== "success" && v !== "fail").length,
+    rate: done ? Math.round((success / done) * 100) : null,
+    created: created.reduce((a, b) => a + b, 0),
+    byHarm: [...byHarm.entries()].sort((a, b) => (b[1].backlog + b[1].success + b[1].fail) - (a[1].backlog + a[1].success + a[1].fail)),
+    byProduct: tally(product, (p) => p),
+    byDay: standup.rows.map((_, r) => ({
+      date: st(standup, idx(standup, "Date"), r),
+      person: st(standup, idx(standup, "Person"), r),
+      n: st(standup, idx(standup, "Exploits created"), r),
+      harm: st(standup, idx(standup, "Harm types"), r),
+    })).reverse().slice(0, 20),
+    next: next.slice(0, 8),
+  };
+  return out;
+}
+
+/* ── demo data ─────────────────────────────────────────────────── */
+
+const DEMO = {
+  verif: { success: 21, fail: 9, backlog: 13 },
+  harm: { "data exfiltration": { success: 8, fail: 4, backlog: 3 }, "workflow disruption": { success: 6, fail: 2, backlog: 3 },
+          "prompt injection": { success: 5, fail: 2, backlog: 1 }, "poisoning output": { success: 2, fail: 1, backlog: 2 } },
+  product: { Studio: 29, Docs: 7, Gmail: 3, Sheets: 4 },
+  days: [
+    { date:"2026-11-02", person:"Bikas", n:39, harm:"data exfiltration, prompt injection" },
+    { date:"2026-11-01", person:"Nidhin", n:4, harm:"poisoning output" },
+  ],
+  next: [{ date:"2026-11-02", person:"Nidhin", next:"rogue actions" }],
+};
+
+/* ── rendering ─────────────────────────────────────────────────── */
+
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+
+function paintKpis(s) {
+  $("kpis").innerHTML = [
+    ["Exploits logged", s.logged],
+    ["Verified success", s.success],
+    ["Failed", s.fail],
+    ["Backlog", s.backlog],
+    ["Success rate of resolved", s.rate === null ? "—" : s.rate + "%"],
+    ["Created (standup)", s.created],
+  ].map(([label, v]) => `<div class="kpi"><b>${esc(v)}</b><span>${esc(label)}</span></div>`).join("");
+}
+
+function table(head, rows, cls = [], foot = null) {
+  if (!rows.length && !foot) return `<p class="empty">Nothing yet.</p>`;
+  const line = (r, tag) => `<tr${tag === "foot" ? ' class="foot"' : ""}>${r.map((c, i) =>
+    `<td class="${cls[i] || ""}">${esc(c)}</td>`).join("")}</tr>`;
+  return `<table><thead><tr>${head.map((h, i) =>
+    `<th class="${cls[i] || ""}">${esc(h)}</th>`).join("")}</tr></thead><tbody>${
+    rows.map((r) => line(r)).join("")}</tbody>${
+    foot ? `<tfoot>${line(foot, "foot")}</tfoot>` : ""}</table>`;
+}
+
+function paint(s) {
+  paintKpis(s);
+  const tot = s.byHarm.reduce((a, [, v]) => [a[0] + v.success, a[1] + v.fail, a[2] + v.backlog], [0, 0, 0]);
+  $("verif").innerHTML = table(["Harm class", "Success", "Fail", "Backlog"],
+    s.byHarm.map(([h, v]) => [h, v.success, v.fail, v.backlog]), ["", "n", "n", "n"], ["Total", ...tot]);
+  $("byproduct").innerHTML = table(["Product", "Logged"],
+    s.byProduct.map(([p, n]) => [p, n]), ["", "n"]);
+  $("output").innerHTML = table(["Date", "Person", "Created", "Harm types"],
+    s.byDay.map((d) => [d.date, d.person, d.n, d.harm]), ["", "", "n", ""]);
+  $("next").innerHTML = table(["Date", "Person", "Next"],
+    s.next.map((d) => [d.date, d.person, d.next]));
+}
+
+function paintDemo() {
+  paint({
+    logged: 43, success: DEMO.verif.success, fail: DEMO.verif.fail, backlog: DEMO.verif.backlog,
+    rate: Math.round(DEMO.verif.success / (DEMO.verif.success + DEMO.verif.fail) * 100),
+    created: DEMO.days.reduce((a, b) => a + b.n, 0),
+    byHarm: Object.entries(DEMO.harm).sort((a, b) => (b[1].success + b[1].fail + b[1].backlog) - (a[1].success + a[1].fail + a[1].backlog)),
+    byProduct: Object.entries(DEMO.product),
+    byDay: DEMO.days, next: DEMO.next,
+  });
+  setSrc("demo", "demo data — not your sheet");
+  $("demo").textContent = "Back to live data";
+}
+
+function setSrc(kind, text) {
+  const el = $("src");
+  el.className = "src " + kind;
+  el.textContent = text;
+}
+
+/* ── loading ───────────────────────────────────────────────────── */
+
+let defaults = {};
+
+async function loadDefaults() {
+  try {
+    const r = await fetch("sources.json", { cache:"no-store" });
+    if (r.ok) defaults = await r.json();
+  } catch { defaults = {}; }
+}
+
+async function loadLive() {
+  const conf = Object.fromEntries(Object.entries(KEYS).map(([k, key]) => [
+    k, parseSheetLink(localStorage.getItem(key) || defaults[k] || ""),
+  ]));
+  if (!conf.standup && !conf.intake && !conf.verif) { setSrc("", "not configured — press Sources"); return; }
+  if (document.activeElement) document.activeElement.blur();
+  setSrc("", "loading…");
+  try {
+    const [standup, intake, verif] = await Promise.all([
+      conf.standup ? fetchTable(conf.standup) : { cols:[], rows:[], index:{ pick:() => -1 } },
+      conf.intake ? fetchTable(conf.intake) : { cols:[], rows:[], index:{ pick:() => -1 } },
+      conf.verif ? fetchTable(conf.verif) : { cols:[], rows:[], index:{ pick:() => -1 } },
+    ]);
+    paint(stats(verif, intake, standup));
+    setSrc("live", `live · ${new Date().toLocaleTimeString()}`);
+  } catch (e) {
+    setSrc("err", "could not read a sheet — " + e.message + "\ncheck the link and that it is shared as Anyone with the link.");
+  }
+}
+
+function startAuto() {
+  clearInterval(timer);
+  timer = setInterval(loadLive, 60000);
+}
+
+/* ── wiring ────────────────────────────────────────────────────── */
+
+$("refresh").onclick = loadLive;
+$("demo").onclick = () => {
+  if ($("demo").textContent.startsWith("Back")) { $("demo").textContent = "Use demo data"; loadLive(); startAuto(); return; }
+  clearInterval(timer); paintDemo();
+};
+$("settings").onclick = () => {
+  Object.entries(KEYS).forEach(([k, key]) => { $("u" + k[0].toUpperCase() + k.slice(1)).value = localStorage.getItem(key) || ""; });
+  $("dlg").showModal();
+};
+$("cancel").onclick = () => $("dlg").close();
+$("save").onclick = () => {
+  Object.entries(KEYS).forEach(([k, key]) => {
+    const v = $("u" + k[0].toUpperCase() + k.slice(1)).value.trim();
+    if (v) localStorage.setItem(key, v); else localStorage.removeItem(key);
+  });
+  $("dlg").close();
+  loadLive();
+  startAuto();
+};
+
+window.__fission = { parseSheetLink, gvizUrl, stats, tally };
+loadDefaults().then(() => { loadLive(); startAuto(); });
+</script>
+</body>
+</html>
